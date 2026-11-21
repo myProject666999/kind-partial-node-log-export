@@ -19,6 +19,7 @@ limitations under the License.
 package providers
 
 import (
+	"sigs.k8s.io/kind/pkg/cluster/internal/logs"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 
 	"sigs.k8s.io/kind/pkg/internal/apis/config"
@@ -45,8 +46,9 @@ type Provider interface {
 	GetAPIServerEndpoint(cluster string) (string, error)
 	// GetAPIServerInternalEndpoint returns the internal network endpoint for the cluster's API server
 	GetAPIServerInternalEndpoint(cluster string) (string, error)
-	// CollectLogs will populate dir with cluster logs and other debug files
-	CollectLogs(dir string, nodes []nodes.Node) error
+	// LogCommands describes the runtime specific commands and filenames used
+	// when exporting cluster logs.
+	LogCommands() logs.ProviderLogCommands
 	// Info returns the provider info
 	Info() (*ProviderInfo, error)
 }

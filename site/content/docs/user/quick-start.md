@@ -475,7 +475,7 @@ kind has the ability to export all kind related logs for you to explore.
 To export all logs from the default cluster (context name `kind`):
 ```
 kind export logs
-Exported logs to: /tmp/396758314
+/tmp/396758314
 ```
 
 Like all other commands, if you want to perform the action on a cluster with a
@@ -486,22 +486,155 @@ temporary directory. If you want to specify a location then simply add the path
 to the directory after the command:
 ```
 kind export logs ./somedir
-Exported logs to: ./somedir
+./somedir
 ```
+The directory is printed on stdout (the progress message goes to stderr), so it
+can be captured by scripts.
 
-The structure of the logs will look more or less like this:
+The structure of the logs looks like this:
 ```
 .
-├── docker-info.txt
+├── summary.json           # machine readable results (see below)
+├── docker-info.txt        # runtime info (podman-info.txt for podman)
+├── kind-version.txt       # the exporting kind version
+├── nodes.txt              # every node and its role, tab separated
 └── kind-control-plane/
-    ├── containers
-    ├── docker.log
-    ├── inspect.json
-    ├── journal.log
-    ├── kubelet.log
+    ├── serial.log         # container runtime logs for the node
+    ├── journal.log        # systemd journal (--no-pager)
+    ├── kubelet.log        # journalctl -u kubelet.service
+    ├── containerd.log     # journalctl -u containerd.service
+    ├── images.log         # crictl images
     ├── kubernetes-version.txt
-    └── pods/
+    ├── system-info.txt    # uname, /proc/version, /etc/os-release, ...
+    ├── inspect.json       # runtime inspect of the node container
+    ├── etcd.log           # static pod logs (control plane only)
+    ├── kube-apiserver.log # static pod logs (control plane only)
+    ├── kube-controller-manager.log
+    ├── kube-scheduler.log
+    └── var-log/           # the node's /var/log (pods, kubelet, ...)
 ```
+Compared to older kind releases, `kind export logs` now also writes
+`summary.json`, `nodes.txt`, `system-info.txt`, `images.log` and the
+control plane component logs, and `/var/log` is extracted into a `var-log/`
+subdirectory instead of being flattened into the node directory.
+
+#### Partial failures and `summary.json`
+Collection is best effort. An unresponsive or unreachable node does not prevent
+the remaining nodes from being exported, so one timeout never discards evidence
+from the others. `summary.json` records every node and step with one of three
+statuses:
+
+* `success` – the step completed and its file is complete.
+* `failure` – the step applies but could not be completed. `reason` is a stable
+  code (`timeout`, `command-error`, `role-unknown`, `write-error`) and `detail`
+  holds a short, UTF-8 sanitized message (missing command, exit status, ...).
+* `not-applicable` – the step does not exist on that node role. For example the
+  control plane component logs are `not-applicable` on workers; they are not
+  failures.
+
+If any step failed, the command exits non-zero, but the summary and all
+collected logs are still written. `not-applicable` steps never fail the export.
+
+`summary.json` intentionally contains no timestamps, durations or per-run byte
+counts, and nodes are sorted by name, so two exports of the same cluster can be
+compared byte for byte.
+
+A trimmed example:
+
+```json
+{
+  "schemaVersion": 1,
+  "cluster": "kind",
+  "kindVersion": "kind v0.34.0 go1.27 linux/amd64",
+  "settings": { "concurrency": 4, "maxLogSizeBytes": 10485760, "stepTimeoutSeconds": 120 },
+  "clusterSteps": [
+    { "name": "kind-version.txt", "file": "kind-version.txt", "status": "success" },
+    { "name": "nodes.txt", "file": "nodes.txt", "status": "success" },
+    { "name": "docker-info.txt", "file": "docker-info.txt", "status": "success" }
+  ],
+  "nodes": [
+    {
+      "name": "kind-control-plane",
+      "directory": "kind-control-plane",
+      "role": "control-plane",
+      "status": "success",
+      "steps": [
+        { "name": "journal.log", "file": "journal.log", "status": "success", "truncated": true },
+        { "name": "etcd.log", "file": "etcd.log", "status": "success" }
+      ]
+    },
+    {
+      "name": "kind-worker",
+      "directory": "kind-worker",
+      "role": "worker",
+      "status": "failure",
+      "steps": [
+        { "name": "journal.log", "file": "journal.log.partial", "status": "failure", "reason": "timeout", "detail": "step exceeded its timeout", "incomplete": true },
+        { "name": "etcd.log", "status": "not-applicable", "reason": "not-applicable", "detail": "only present on control-plane nodes" }
+      ]
+    }
+  ]
+}
+```
+
+#### Incomplete and truncated files
+A step that did not complete writes `<name>.partial` instead of `<name>`, and
+`summary.json` sets `incomplete: true`. Scripts should treat any `*.partial`
+path as incomplete evidence.
+
+Each log file is capped at `--max-log-size` (default `10MiB`) and only the
+**tail** is kept, because the latest lines are usually the relevant ones. Such
+files are marked `truncated: true` in the summary. Pass `--max-log-size=0`
+(alias `unlimited`) to keep full files; the export then has no size bound and
+may consume a lot of disk. The same limit is applied per file inside `var-log/`.
+Since only a bounded tail is held in memory, a multi-gigabyte journal does not
+have to fit in RAM, and a timed out step still leaves whatever it wrote behind
+as a `.partial` file.
+
+#### stdout and stderr, timeouts and parallelism
+Each step's standard output and standard error are merged into a single file in
+arrival order. Writes from the two streams are not line-atomic, so a reader may
+see a partial line from one stream split around the other; journald diagnostics
+on stderr are therefore preserved in place.
+
+Every step has its own timeout (`--timeout`, default `2m`). On timeout the step
+is marked `timeout` and the partially written file is kept with the `.partial`
+suffix. Timeouts release the kind-side process; a process inside the node
+started through the runtime CLI may take a little longer to notice.
+
+Nodes are collected in parallel, bounded by `--concurrency` (default `4`);
+steps within one node run sequentially. Worst case wall time is roughly
+`ceil(nodes/concurrency) * steps * timeout`.
+
+#### Encoding and line endings
+Log files contain the raw bytes captured from the node; they are not
+re-encoded, newline-translated or UTF-8 validated, so binary content is
+preserved. `summary.json`, `nodes.txt` and `kind-version.txt` are UTF-8 with
+`\n` line endings: invalid UTF-8 in a node name or error message is replaced
+with U+FFFD and control characters are escaped, so the summary always stays
+parseable. `nodes.txt` is tab separated; tabs, newlines and backslashes in a
+node name are backslash-escaped rather than allowed to split a record.
+
+#### Directory layout and safety
+Each node gets one flat directory at the top level. The directory name is the
+node name, with any byte outside `[A-Za-z0-9._-]` percent-encoded (and a first
+byte escaped for reserved names such as `summary.json`, leading dots, and
+Windows device names), so no information is lost and no path traversal is
+possible. `summary.json` keeps the original `name` alongside `directory`.
+
+If the target directory exists and is **not empty**, `kind export logs` refuses
+to run and leaves the existing contents untouched. A missing directory is
+created and an existing empty directory is used.
+
+Exporting is read-only: no component is restarted, no log rotation or journal
+vacuum is triggered, the cluster state is not changed, and no temporary files
+are created inside the nodes (`/var/log` is streamed out as a tar archive).
+Host-side temporary files are removed on success and failure; `.partial` files
+are retained on purpose as explicitly marked incomplete evidence.
+
+If the exporting kind binary itself is interrupted, `summary.json` may be
+missing; treat its absence as "the export did not finish".
+
 The logs contain information about the Docker host, the containers running
 kind, the Kubernetes cluster itself, etc.
 

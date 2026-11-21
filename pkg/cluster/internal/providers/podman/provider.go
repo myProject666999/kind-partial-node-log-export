@@ -17,14 +17,15 @@ limitations under the License.
 package podman
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
+	"sigs.k8s.io/kind/pkg/cluster/internal/logs"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/errors"
@@ -332,37 +333,18 @@ func (p *provider) node(name string) nodes.Node {
 	}
 }
 
-// CollectLogs will populate dir with cluster logs and other debug files
-func (p *provider) CollectLogs(dir string, nodes []nodes.Node) error {
-	execToPathFn := func(cmd exec.Cmd, path string) func() error {
-		return func() error {
-			f, err := common.FileOnHost(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			return cmd.SetStdout(f).SetStderr(f).Run()
-		}
+// LogCommands implements providers.Provider
+func (p *provider) LogCommands() logs.ProviderLogCommands {
+	return logs.ProviderLogCommands{
+		InfoFile: "podman-info.txt",
+		InfoCommand: func(ctx context.Context) exec.Cmd {
+			return exec.CommandContext(ctx, "podman", "info")
+		},
+		InspectFile: "inspect.json",
+		InspectCommand: func(ctx context.Context, name string) exec.Cmd {
+			return exec.CommandContext(ctx, "podman", "inspect", name)
+		},
 	}
-	// construct a slice of methods to collect logs
-	fns := []func() error{
-		// record info about the host podman
-		execToPathFn(
-			exec.Command("podman", "info"),
-			filepath.Join(dir, "podman-info.txt"),
-		),
-	}
-	// inspect each node
-	for _, n := range nodes {
-		node := n // https://golang.org/doc/faq#closures_and_goroutines
-		name := node.String()
-		path := filepath.Join(dir, name)
-		fns = append(fns,
-			execToPathFn(exec.Command("podman", "inspect", name), filepath.Join(path, "inspect.json")),
-		)
-	}
-	// run and collect up all errors
-	return errors.AggregateConcurrent(fns)
 }
 
 // Info returns the provider info.

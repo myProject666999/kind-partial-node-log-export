@@ -18,11 +18,13 @@ package logs
 
 import (
 	"archive/tar"
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"al.essio.dev/pkg/shellescape"
 
@@ -34,7 +36,15 @@ import (
 
 // DumpDir dumps the dir nodeDir on the node to the dir hostDir on the host
 func DumpDir(logger log.Logger, node nodes.Node, nodeDir, hostDir string) (err error) {
-	cmd := node.Command(
+	return DumpDirContext(context.Background(), logger, node, nodeDir, hostDir)
+}
+
+// DumpDirContext is like DumpDir, but honors ctx so that a stuck node cannot
+// block the export. It never writes an archive to the node or to disk: the tar
+// stream is consumed and extracted as it arrives.
+func DumpDirContext(ctx context.Context, logger log.Logger, node nodes.Node, nodeDir, hostDir string) (err error) {
+	cmd := node.CommandContext(
+		ctx,
 		"sh", "-c",
 		// Tar will exit 1 if a file changed during the archival.
 		// We don't care about this, so we're invoking it in a shell
@@ -47,7 +57,7 @@ func DumpDir(logger log.Logger, node nodes.Node, nodeDir, hostDir string) (err e
 		),
 	)
 
-	return exec.RunWithStdoutReader(cmd, func(outReader io.Reader) error {
+	return exec.RunWithStdoutReaderContext(ctx, cmd, func(outReader io.Reader) error {
 		if err := untar(logger, outReader, hostDir); err != nil {
 			return errors.Wrapf(err, "Untarring %q: %v", nodeDir, err)
 		}
@@ -73,11 +83,18 @@ func untar(logger log.Logger, r io.Reader, dir string) (err error) {
 			continue
 		}
 
-		rel := filepath.FromSlash(f.Name)
-		abs := filepath.Join(dir, rel)
+		abs, err := safeJoin(dir, f.Name)
+		if err != nil {
+			return err
+		}
 
 		switch f.Typeflag {
 		case tar.TypeReg:
+			// Some tar producers omit directory entries; create the parent
+			// before opening the file.
+			if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+				return err
+			}
 			wf, err := os.OpenFile(abs, os.O_CREATE|os.O_RDWR, os.FileMode(f.Mode))
 			if err != nil {
 				return err
@@ -102,4 +119,19 @@ func untar(logger log.Logger, r io.Reader, dir string) (err error) {
 			logger.Warnf("tar file entry %s contained unsupported file type %v", f.Name, f.Typeflag)
 		}
 	}
+}
+
+// safeJoin joins name onto dir, rejecting entries that would escape dir.
+func safeJoin(dir, name string) (string, error) {
+	clean := path.Clean("/" + filepath.ToSlash(name))
+	if clean == "/" {
+		return dir, nil
+	}
+	rel := strings.TrimPrefix(clean, "/")
+	abs := filepath.Join(dir, filepath.FromSlash(rel))
+	relCheck, err := filepath.Rel(dir, abs)
+	if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("tar entry %q escapes destination %q", name, dir)
+	}
+	return abs, nil
 }

@@ -19,9 +19,11 @@ package exec
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"al.essio.dev/pkg/shellescape"
 
@@ -103,22 +105,70 @@ func InheritOutput(cmd Cmd) Cmd {
 
 // RunWithStdoutReader runs cmd with stdout piped to readerFunc
 func RunWithStdoutReader(cmd Cmd, readerFunc func(io.Reader) error) error {
+	return RunWithStdoutReaderContext(context.Background(), cmd, readerFunc)
+}
+
+// RunWithStdoutReaderContext is like RunWithStdoutReader, but honors ctx.
+// The command is expected to have been created with CommandContext so that
+// cancellation actually releases the underlying process; the pipe writer is
+// excluded from error capture so that large streams are not buffered in memory.
+func RunWithStdoutReaderContext(ctx context.Context, cmd Cmd, readerFunc func(io.Reader) error) error {
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	cmd.SetStdout(pw)
+	// 'pw' is the same writer for stdout and stderr by convention here; make
+	// sure the tar stream is not copied into an unbounded error buffer.
+	cmd.SetStdout(WithoutOutputCapture(pw))
+	// Keep a bounded snippet of stderr so a failure can explain itself (e.g.
+	// "tar: /var/log: Cannot open"); the archive itself is stdout only.
+	stderr := &boundedBuffer{max: 4096}
+	cmd.SetStderr(stderr)
 
-	return errors.AggregateConcurrent([]func() error{
-		func() error {
-			defer pr.Close()
-			return readerFunc(pr)
-		},
-		func() error {
-			defer pw.Close()
-			return cmd.Run()
-		},
-	})
+	errCh := make(chan error, 2)
+	var prOnce, pwOnce sync.Once
+	closePr := func() { prOnce.Do(func() { _ = pr.Close() }) }
+	closePw := func() { pwOnce.Do(func() { _ = pw.Close() }) }
+	go func() {
+		defer closePr()
+		errCh <- readerFunc(pr)
+	}()
+	go func() {
+		defer closePw()
+		err := cmd.Run()
+		if err != nil && stderr.Len() > 0 {
+			err = errors.Errorf("%v: %s", err, strings.TrimSpace(stderr.String()))
+		}
+		errCh <- err
+	}()
+
+	var errs []error
+	received := 0
+	record := func(err error) {
+		received++
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for received < 2 {
+		select {
+		case err := <-errCh:
+			record(err)
+		case <-ctx.Done():
+			// Closing our end unblocks the reader. Closing the write end too
+			// makes the local command's output copy fail, which releases it
+			// even if a grandchild process inherited the real fd and does not
+			// exit on cancellation. Neither close can race with the
+			// goroutines' own deferred closes.
+			closePr()
+			closePw()
+			errs = append(errs, ctx.Err())
+			for received < 2 {
+				record(<-errCh)
+			}
+		}
+	}
+	return errors.NewAggregate(errs)
 }
 
 // RunWithStdinWriter runs cmd with writerFunc piped to stdin

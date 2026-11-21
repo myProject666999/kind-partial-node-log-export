@@ -36,7 +36,12 @@ func (n *node) String() string {
 }
 
 func (n *node) Role() (string, error) {
-	cmd := exec.Command("podman", "inspect",
+	return n.RoleContext(context.Background())
+}
+
+// RoleContext is like Role, but honors ctx so log collection can time out.
+func (n *node) RoleContext(ctx context.Context) (string, error) {
+	cmd := exec.CommandContext(ctx, "podman", "inspect",
 		"--format", fmt.Sprintf(`{{ index .Config.Labels "%s"}}`, nodeRoleLabelKey),
 		n.name,
 	)
@@ -167,5 +172,11 @@ func (c *nodeCmd) SetStderr(w io.Writer) exec.Cmd {
 }
 
 func (n *node) SerialLogs(w io.Writer) error {
-	return exec.Command("podman", "logs", n.name).SetStdout(w).SetStderr(w).Run()
+	return n.SerialLogsContext(context.Background(), w)
+}
+
+// SerialLogsContext is like SerialLogs, but honors ctx so log collection can
+// time out and release the process.
+func (n *node) SerialLogsContext(ctx context.Context, w io.Writer) error {
+	return exec.CommandContext(ctx, "podman", "logs", n.name).SetStdout(w).SetStderr(w).Run()
 }

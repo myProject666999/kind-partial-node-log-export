@@ -17,9 +17,9 @@ limitations under the License.
 package cluster
 
 import (
-	"os"
-	"path/filepath"
+	"fmt"
 	"sort"
+	"time"
 
 	"sigs.k8s.io/kind/pkg/cmd/kind/version"
 
@@ -27,7 +27,6 @@ import (
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/errors"
-	"sigs.k8s.io/kind/pkg/exec"
 	"sigs.k8s.io/kind/pkg/log"
 
 	internalcreate "sigs.k8s.io/kind/pkg/cluster/internal/create"
@@ -35,7 +34,6 @@ import (
 	"sigs.k8s.io/kind/pkg/cluster/internal/kubeconfig"
 	internallogs "sigs.k8s.io/kind/pkg/cluster/internal/logs"
 	internalproviders "sigs.k8s.io/kind/pkg/cluster/internal/providers"
-	"sigs.k8s.io/kind/pkg/cluster/internal/providers/common"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/docker"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/nerdctl"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/podman"
@@ -235,93 +233,73 @@ func (p *Provider) ListInternalNodes(name string) ([]nodes.Node, error) {
 	return nodeutils.InternalNodes(n)
 }
 
+// LogExportOptions controls log collection for CollectLogsWithOptions.
+//
+// The zero value is not used directly: unspecified fields fall back to the
+// documented defaults (concurrency 4, 2m per step, 10 MiB per file).
+type LogExportOptions struct {
+	// Concurrency bounds how many nodes are collected in parallel.
+	Concurrency int
+	// StepTimeout bounds each individual collection step.
+	StepTimeout time.Duration
+	// MaxLogSize is the number of bytes retained per log file (the tail).
+	// Nil selects the default (10 MiB); a pointer to zero keeps entire logs
+	// and may produce very large exports.
+	MaxLogSize *int64
+}
+
+// CheckLogsDir validates a `kind export logs` destination without modifying it.
+//
+// A missing directory or an existing empty directory is accepted. An existing
+// non-empty directory is refused so pre-existing evidence is never overwritten.
+// Callers can use this to fail before claiming an output path.
+func CheckLogsDir(dir string) error {
+	return internallogs.CheckOutputDir(dir)
+}
+
 // CollectLogs will populate dir with cluster logs and other debug files
 func (p *Provider) CollectLogs(name, dir string) error {
-	// TODO: should use ListNodes and Collect should handle nodes differently
-	// based on role ...
-	internalNodes, err := p.ListInternalNodes(name)
+	return p.CollectLogsWithOptions(name, dir, LogExportOptions{})
+}
+
+// CollectLogsWithOptions is like CollectLogs, but allows tuning timeouts,
+// parallelism and truncation.
+//
+// Collection is best effort: unresponsive nodes do not prevent the other nodes
+// from being exported. A summary.json describing every node and step is always
+// written, and the returned error aggregates the steps that failed (steps that
+// do not apply to a node role are not failures).
+func (p *Provider) CollectLogsWithOptions(name, dir string, opts LogExportOptions) error {
+	allNodes, err := p.provider.ListNodes(defaultName(name))
 	if err != nil {
 		return err
 	}
-
-	// ensure directory
-	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
-		return errors.Wrap(err, "failed to create logs directory")
+	if len(allNodes) == 0 {
+		return fmt.Errorf("unknown cluster %q", defaultName(name))
 	}
 
-	// write kind version
-	if err := os.WriteFile(
-		filepath.Join(dir, "kind-version.txt"),
-		[]byte(version.DisplayVersion()),
-		0666, // match os.Create
-	); err != nil {
-		return errors.Wrap(err, "failed to write kind-version.txt")
+	defaults := internallogs.DefaultOptions()
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = defaults.Concurrency
 	}
-
-	// common portable log collection for the nodes
-	fns := []func() error{}
-	var errs []error
-	for _, n := range internalNodes {
-		node := n // https://golang.org/doc/faq#closures_and_goroutines
-		name := node.String()
-		path := filepath.Join(dir, name)
-		fns = append(fns,
-			func() error { return collectNodeLogs(p.logger, node, path) },
-		)
+	if opts.StepTimeout <= 0 {
+		opts.StepTimeout = defaults.StepTimeout
 	}
-	errs = append(errs, errors.AggregateConcurrent(fns))
-
-	// additional, provider specific log collection
-	errs = append(errs, p.provider.CollectLogs(dir, internalNodes))
-
-	// flatten
-	return errors.NewAggregate(errs)
-}
-
-func collectNodeLogs(logger log.Logger, n nodes.Node, dir string) error {
-	execToPathFn := func(cmd exec.Cmd, path string) func() error {
-		return func() error {
-			f, err := common.FileOnHost(filepath.Join(dir, path))
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			return cmd.SetStdout(f).SetStderr(f).Run()
+	maxLogSize := defaults.MaxLogSize
+	if opts.MaxLogSize != nil {
+		if *opts.MaxLogSize < 0 {
+			return fmt.Errorf("max log size must not be negative")
 		}
+		maxLogSize = *opts.MaxLogSize
 	}
 
-	return errors.AggregateConcurrent([]func() error{
-		func() error {
-			f, err := common.FileOnHost(filepath.Join(dir, "serial.log"))
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			return n.SerialLogs(f)
-		},
-		func() error {
-			return internallogs.DumpDir(logger, n, "/var/log", dir)
-		},
-		// record info about the node container
-		execToPathFn(
-			n.Command("cat", "/kind/version"),
-			"kubernetes-version.txt",
-		),
-		execToPathFn(
-			n.Command("journalctl", "--no-pager"),
-			"journal.log",
-		),
-		execToPathFn(
-			n.Command("journalctl", "--no-pager", "-u", "kubelet.service"),
-			"kubelet.log",
-		),
-		execToPathFn(
-			n.Command("journalctl", "--no-pager", "-u", "containerd.service"),
-			"containerd.log",
-		),
-		execToPathFn(
-			n.Command("crictl", "images"),
-			"images.log",
-		),
-	})
+	internalOpts := internallogs.Options{
+		Concurrency: opts.Concurrency,
+		StepTimeout: opts.StepTimeout,
+		MaxLogSize:  maxLogSize,
+		Logger:      p.logger,
+		KindVersion: version.DisplayVersion(),
+	}
+	_, err = internallogs.Collect(defaultName(name), dir, allNodes, p.provider.LogCommands(), internalOpts)
+	return err
 }

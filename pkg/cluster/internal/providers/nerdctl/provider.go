@@ -17,14 +17,15 @@ limitations under the License.
 package nerdctl
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"net"
 	osexec "os/exec"
-	"path/filepath"
 	"strings"
 
+	"sigs.k8s.io/kind/pkg/cluster/internal/logs"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/errors"
 	"sigs.k8s.io/kind/pkg/exec"
@@ -281,37 +282,20 @@ func (p *provider) node(name string) nodes.Node {
 	}
 }
 
-// CollectLogs will populate dir with cluster logs and other debug files
-func (p *provider) CollectLogs(dir string, nodes []nodes.Node) error {
-	execToPathFn := func(cmd exec.Cmd, path string) func() error {
-		return func() error {
-			f, err := common.FileOnHost(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			return cmd.SetStdout(f).SetStderr(f).Run()
-		}
+// LogCommands implements providers.Provider
+func (p *provider) LogCommands() logs.ProviderLogCommands {
+	return logs.ProviderLogCommands{
+		// NOTE: docker-info.txt is kept for compatibility with earlier
+		// releases even though this provider is not docker.
+		InfoFile: "docker-info.txt",
+		InfoCommand: func(ctx context.Context) exec.Cmd {
+			return exec.CommandContext(ctx, p.Binary(), "info")
+		},
+		InspectFile: "inspect.json",
+		InspectCommand: func(ctx context.Context, name string) exec.Cmd {
+			return exec.CommandContext(ctx, p.Binary(), "inspect", name)
+		},
 	}
-	// construct a slice of methods to collect logs
-	fns := []func() error{
-		// record info about the host nerdctl
-		execToPathFn(
-			exec.Command(p.Binary(), "info"),
-			filepath.Join(dir, "docker-info.txt"),
-		),
-	}
-	// inspect each node
-	for _, n := range nodes {
-		node := n // https://golang.org/doc/faq#closures_and_goroutines
-		name := node.String()
-		path := filepath.Join(dir, name)
-		fns = append(fns,
-			execToPathFn(exec.Command(p.Binary(), "inspect", name), filepath.Join(path, "inspect.json")),
-		)
-	}
-	// run and collect up all errors
-	return errors.AggregateConcurrent(fns)
 }
 
 // Info returns the provider info.

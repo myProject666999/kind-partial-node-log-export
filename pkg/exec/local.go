@@ -88,6 +88,18 @@ func (cmd *LocalCmd) Run() error {
 	// IFF ! interfaceEqual(cmd.Sterr, cmd.Stdout)
 	var combinedOutput bytes.Buffer
 	var combinedOutputWriter io.Writer = &combinedOutput
+	// If the caller explicitly opted out of output capture (see
+	// WithoutOutputCapture), pass the writers through unchanged. This keeps
+	// memory bounded for streaming commands; RunError.Output will be empty.
+	if isCaptureDisabled(cmd.Stdout) || isCaptureDisabled(cmd.Stderr) {
+		if err := cmd.Cmd.Run(); err != nil {
+			return errors.WithStack(&RunError{
+				Command: cmd.Args,
+				Inner:   err,
+			})
+		}
+		return nil
+	}
 	if cmd.Stdout == nil && cmd.Stderr == nil {
 		// Case 1: If stdout and stderr are nil, we can just use the buffer
 		// The buffer will be == and Go will use one fd / goroutine
